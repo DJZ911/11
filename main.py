@@ -1,120 +1,173 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import lightgbm as lgb
 import warnings
 
 warnings.filterwarnings('ignore')
 
-# 1. 数据加载
-train_path = 'D:/python_dome/train.csv'
-testA_path = 'D:/python_dome/testA.csv'
-sample_submit_path = 'D:/python_dome/sample_submit.csv'
 
-train_data = pd.read_csv(train_path)
-testA_data = pd.read_csv(testA_path)
+# 1. 数据加载与预处理 - 修复文件路径转义问题
+def load_data():
+    # 使用原始字符串或双反斜杠避免转义错误
+    train = pd.read_csv(r'D:\python_dome\train.csv')  # 添加r前缀
+    test = pd.read_csv(r'D:\python_dome\testA.csv')  # 添加r前缀
+
+    full_data = pd.concat([train, test], axis=0, ignore_index=True)
+    return full_data, train.shape[0]
 
 
-# 2. 数据预处理
-def preprocess(df):
-    # 处理时间特征
+# 2. 特征工程 - 修复employmentLength转换错误
+def feature_engineering(df):
+    # 处理日期特征
     df['issueDate'] = pd.to_datetime(df['issueDate'])
-    df['issueDate_year'] = df['issueDate'].dt.year
-    df['issueDate_month'] = df['issueDate'].dt.month
-    df['issueDate_day'] = df['issueDate'].dt.day
+    df['issue_year'] = df['issueDate'].dt.year
+    df['issue_month'] = df['issueDate'].dt.month
+    df['issue_day'] = df['issueDate'].dt.day
 
-    # 处理就业年限
-    df['employmentLength'].replace({'< 1 year': '0', '10+ years': '10'}, inplace=True)
-    df['employmentLength'] = df['employmentLength'].str.extract('(\d+)').astype(float)
+    # 计算债务负担比率
+    df['debt_burden'] = df['loanAmnt'] / (df['annualIncome'] + 1e-5)
 
-    # 处理最早信用记录
-    df['earliesCreditLine'] = df['earliesCreditLine'].str[-4:].astype(int)
+    # 修复就业年限转换问题[4,6,11](@ref)
+    # 先替换特殊值，再提取数字部分
+    employment_map = {'< 1 year': '0', '10+ years': '10'}
+    df['employmentLength'] = df['employmentLength'].replace(employment_map)
 
-    # 删除原始时间列
-    df.drop(['issueDate'], axis=1, inplace=True)
+    # 提取数字部分并转换为浮点数[4,6](@ref)
+    df['employmentLength'] = (
+        df['employmentLength']
+        .str.extract(r'(\d+)', expand=False)  # 提取数字部分
+        .astype(float)
+    )
+
+    # 信用评分范围处理
+    df['fico_avg'] = (df['ficoRangeLow'] + df['ficoRangeHigh']) / 2
+
+    # 删除不需要的特征
+    df.drop(['issueDate', 'ficoRangeLow', 'ficoRangeHigh'], axis=1, inplace=True)
 
     return df
 
 
-train_data = preprocess(train_data)
-testA_data = preprocess(testA_data)
+# 3. 数据预处理
+def preprocess_data(df):
+    # 分类特征编码
+    cat_features = ['grade', 'subGrade', 'homeOwnership', 'verificationStatus',
+                    'purpose', 'regionCode', 'applicationType', 'initialListStatus']
 
-# 3. 特征工程
-# 选择特征列（根据比赛提供的字段表）
-features = ['loanAmnt', 'term', 'interestRate', 'installment', 'grade', 'subGrade',
-            'employmentLength', 'homeOwnership', 'annualIncome', 'verificationStatus',
-            'purpose', 'regionCode', 'dti', 'delinquency_2years', 'ficoRangeLow',
-            'ficoRangeHigh', 'openAcc', 'pubRec', 'pubRecBankruptcies', 'revolBal',
-            'revolUtil', 'totalAcc', 'initialListStatus', 'applicationType',
-            'earliesCreditLine', 'policyCode', 'issueDate_year', 'issueDate_month',
-            'issueDate_day'] + [f'n{i}' for i in range(15)]
+    for col in cat_features:
+        df[col] = df[col].astype('category')
+        df[col] = df[col].cat.codes + 1  # 避免0值
 
-# 类别特征编码
-cat_features = ['grade', 'subGrade', 'homeOwnership', 'verificationStatus',
-                'purpose', 'initialListStatus', 'applicationType']
+    # 处理缺失值 - 使用更安全的to_numeric方法[1,6,11](@ref)
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # 尝试转换为数值类型，失败则保留原值
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-for col in cat_features:
-    train_data[col] = train_data[col].astype('category')
-    testA_data[col] = testA_data[col].astype('category')
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col].fillna(df[col].median(), inplace=True)
 
-# 4. 划分训练集和验证集
-X_train = train_data[features]
-y_train = train_data['isDefault']
-X_test = testA_data[features]
+    # 特征缩放
+    scaler = StandardScaler()
+    num_features = ['loanAmnt', 'annualIncome', 'debt_burden', 'openAcc', 'revolBal', 'fico_avg']
+    df[num_features] = scaler.fit_transform(df[num_features])
 
-X_train, X_val, y_train, y_val = train_test_split(
-    X_train, y_train, test_size=0.2, random_state=42)
+    return df
 
-# 5. 构建LightGBM模型
-params = {
-    'objective': 'binary',
-    'metric': 'auc',
-    'boosting_type': 'gbdt',
-    'learning_rate': 0.05,
-    'num_leaves': 31,
-    'max_depth': -1,
-    'min_child_samples': 20,
-    'feature_fraction': 0.8,
-    'bagging_fraction': 0.8,
-    'bagging_freq': 5,
-    'seed': 42,
-    'verbose': -1
-}
 
-lgb_train = lgb.Dataset(X_train, y_train, categorical_feature=cat_features)
-lgb_val = lgb.Dataset(X_val, y_val, reference=lgb_train, categorical_feature=cat_features)
+# 4. 模型训练与评估
+def train_model(train_data, test_size=0.2):
+    # 划分特征和目标变量
+    X = train_data.drop(['isDefault', 'id'], axis=1)
+    y = train_data['isDefault']
 
-model = lgb.train(
-    params,
-    lgb_train,
-    valid_sets=[lgb_train, lgb_val],
-    num_boost_round=1000,
-    early_stopping_rounds=50,
-    verbose_eval=50
-)
+    # 划分训练集和验证集
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=test_size, random_state=42, stratify=y
+    )
 
-# 6. 模型评估
-val_pred = model.predict(X_val, num_iteration=model.best_iteration)
-val_auc = roc_auc_score(y_val, val_pred)
-print(f'Validation AUC: {val_auc:.4f}')
+    # 创建LightGBM数据集
+    lgb_train = lgb.Dataset(X_train, y_train)
+    lgb_val = lgb.Dataset(X_val, y_val, reference=lgb_train)
 
-# 7. 预测测试集并生成提交文件
-test_pred = model.predict(X_test, num_iteration=model.best_iteration)
+    # 模型参数
+    params = {
+        'objective': 'binary',
+        'metric': 'auc',
+        'boosting_type': 'gbdt',
+        'num_leaves': 31,
+        'learning_rate': 0.05,
+        'feature_fraction': 0.9,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 5,
+        'verbose': -1,
+        'seed': 42
+    }
 
-submit = pd.DataFrame({
-    'id': testA_data['id'],
-    'isDefault': test_pred
-})
+    # 训练模型
+    model = lgb.train(
+        params,
+        lgb_train,
+        num_boost_round=1000,
+        valid_sets=[lgb_val],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=100)
+        ]
+    )
 
-submit.to_csv('submission.csv', index=False)
-print('Submission file saved as submission.csv')
+    # 验证集预测
+    val_preds = model.predict(X_val)
+    auc_score = roc_auc_score(y_val, val_preds)
+    print(f'Validation AUC: {auc_score:.4f}')
 
-# 8. 特征重要性分析
-feature_importance = pd.DataFrame({
-    'feature': features,
-    'importance': model.feature_importance()
-}).sort_values('importance', ascending=False)
+    return model
 
-print('\nTop 10 important features:')
-print(feature_importance.head(10))
+
+# 5. 生成预测结果
+def generate_submission(model, test_data, train_size):
+    # 提取测试集
+    test_df = test_data[test_data.index >= train_size].copy()
+    test_df.reset_index(drop=True, inplace=True)
+
+    # 准备测试特征
+    X_test = test_df.drop(['id', 'isDefault'], axis=1)
+
+    # 生成预测
+    predictions = model.predict(X_test)
+
+    # 创建提交文件
+    submission = pd.DataFrame({
+        'id': test_df['id'],
+        'isDefault': predictions
+    })
+
+    return submission
+
+
+# 主程序
+if __name__ == "__main__":
+    # 数据加载
+    full_data, train_size = load_data()
+
+    # 特征工程
+    full_data = feature_engineering(full_data)
+
+    # 数据预处理
+    full_data = preprocess_data(full_data)
+
+    # 分离训练集和测试集
+    train_data = full_data.iloc[:train_size]
+
+    # 模型训练
+    model = train_model(train_data)
+
+    # 生成预测结果
+    submission = generate_submission(model, full_data, train_size)
+
+    # 保存结果
+    submission.to_csv(r'D:/python_dome/submission.csv', index=False)
+    print('结果已保存至: D:/python_dome/submission.csv')
